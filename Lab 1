@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+
+import rospy
+import math
+import tf
+from geometry_msgs.msg import Twist, PoseStamped, Quaternion
+from nav_msgs.msg import Odometry
+
+
+class myTurtle():
+
+    def __init__(self) -> None:
+        """
+        Initialize the node, publisher, subscriber, and internal state.
+        """
+        rospy.init_node('my_turtle', anonymous=True)
+
+        # Publisher: send velocity commands to the robot
+        self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+
+        # Subscriber: receive odometry updates
+        self.odom_sub = rospy.Subscriber('/odom', Odometry, self.odom_cb)
+
+        # Internal pose state (updated by odom_cb)
+        self.x = 0.0
+        self.y = 0.0
+        self.theta = 0.0  # yaw in radians
+
+        # Control rate
+        self.rate = rospy.Rate(10)  # 10 Hz
+
+        # Give the subscriber time to connect
+        rospy.sleep(0.5)
+
+    # ------------------------------------------------------------------
+    # Odometry callback
+    # ------------------------------------------------------------------
+
+    def odom_cb(self, msg: Odometry) -> None:
+        """
+        Callback: updates internal (x, y, theta) from the odometry message.
+        """
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        self.theta = self.convert_to_euler(msg.pose.pose.orientation)
+
+    # ------------------------------------------------------------------
+    # Utility helpers
+    # ------------------------------------------------------------------
+
+    def convert_to_euler(self, quat: Quaternion) -> float:
+        """
+        Convert a geometry_msgs/Quaternion to a yaw angle (radians).
+        Returns the yaw (rotation about the Z-axis).
+        """
+        euler = tf.transformations.euler_from_quaternion([
+            quat.x, quat.y, quat.z, quat.w
+        ])
+        return euler[2]  # yaw
+
+    @staticmethod
+    def _normalize_angle(angle: float) -> float:
+        """Wrap angle to [-pi, pi]."""
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    # ------------------------------------------------------------------
+    # Motion primitives
+    # ------------------------------------------------------------------
+
+    def stop(self) -> None:
+        """Publish a zero-velocity Twist to stop the robot."""
+        twist = Twist()
+        self.cmd_pub.publish(twist)
+        rospy.sleep(0.1)
+
+    def drive_straight(self, dist: float, vel: float = 0.2) -> None:
+        """
+        Drive in a straight line for `dist` metres at speed `vel` (m/s).
+        Uses odometry to know when to stop.
+        """
+        start_x = self.x
+        start_y = self.y
+
+        twist = Twist()
+        twist.linear.x = vel if dist >= 0 else -vel
+
+        rospy.loginfo(f"drive_straight: {dist:.2f} m @ {vel:.2f} m/s")
+
+        while not rospy.is_shutdown():
+            travelled = math.sqrt((self.x - start_x) ** 2 +
+                                  (self.y - start_y) ** 2)
+            if travelled >= abs(dist):
+                break
+            self.cmd_pub.publish(twist)
+            self.rate.sleep()
+
+        self.stop()
+
+    def rotate(self, angle: float, ang_vel: float = 0.5) -> None:
+        """
+        Rotate in place by `angle` radians (positive = CCW).
+        Uses odometry yaw to know when to stop.
+        """
+        target = self._normalize_angle(self.theta + angle)
+
+        twist = Twist()
+        twist.angular.z = ang_vel if angle >= 0 else -ang_vel
+
+        rospy.loginfo(f"rotate: {math.degrees(angle):.1f} deg")
+
+        while not rospy.is_shutdown():
+            err = self._normalize_angle(target - self.theta)
+            if abs(err) < 0.03:  # ~1.7 degree tolerance
+                break
+            self.cmd_pub.publish(twist)
+            self.rate.sleep()
+
+        self.stop()
+
+    def spin_wheels(self, u1: float, u2: float, time: float) -> None:
+        """
+        Spin left wheel at u1 (rad/s) and right wheel at u2 (rad/s)
+        for `time` seconds by computing equivalent linear/angular velocities.
+
+        TurtleBot3 Waffle wheel base L = 0.287 m, wheel radius r = 0.033 m.
+        v  = r * (u1 + u2) / 2
+        ω  = r * (u2 - u1) / L
+        """
+        r = 0.033   # wheel radius (m)
+        L = 0.287   # wheel base (m)
+
+        linear_v  = r * (u1 + u2) / 2.0
+        angular_w = r * (u2 - u1) / L
+
+        twist = Twist()
+        twist.linear.x  = linear_v
+        twist.angular.z = angular_w
+
+        rospy.loginfo(f"spin_wheels: u1={u1:.2f}, u2={u2:.2f}, t={time:.2f}s")
+
+        end_time = rospy.Time.now() + rospy.Duration(time)
+        while not rospy.is_shutdown() and rospy.Time.now() < end_time:
+            self.cmd_pub.publish(twist)
+            self.rate.sleep()
+
+        self.stop()
+
+    # ------------------------------------------------------------------
+    # Higher-level behaviours
+    # ------------------------------------------------------------------
+
+    def drive_circle(self, radius: float, vel: float = 0.2) -> None:
+        """
+        Drive one full circle of the given `radius` (m).
+        angular_vel = linear_vel / radius
+        """
+        circumference = 2.0 * math.pi * abs(radius)
+        duration = circumference / vel
+
+        twist = Twist()
+        twist.linear.x  = vel
+        twist.angular.z = vel / radius  # negative radius → clockwise
+
+        rospy.loginfo(f"drive_circle: r={radius:.2f} m, est. {duration:.1f}s")
+
+        end_time = rospy.Time.now() + rospy.Duration(duration)
+        while not rospy.is_shutdown() and rospy.Time.now() < end_time:
+            self.cmd_pub.publish(twist)
+            self.rate.sleep()
+
+        self.stop()
+
+    def drive_square(self, side: float = 0.5, vel: float = 0.2) -> None:
+        """
+        Drive a square with sides of length `side` metres.
+        """
+        rospy.loginfo(f"drive_square: side={side:.2f} m")
+        for _ in range(4):
+            self.drive_straight(side, vel)
+            rospy.sleep(0.3)
+            self.rotate(math.pi / 2.0)
+            rospy.sleep(0.3)
+
+    def nav_to_pose(self, goal: PoseStamped) -> None:
+        """
+        Navigate to a goal PoseStamped:
+          1. Rotate to face the goal position.
+          2. Drive straight to the goal position.
+          3. Rotate to match the goal orientation.
+        """
+        gx = goal.pose.position.x
+        gy = goal.pose.position.y
+
+        # -- Step 1: turn to face the goal --
+        dx = gx - self.x
+        dy = gy - self.y
+        angle_to_goal = math.atan2(dy, dx)
+        heading_err = self._normalize_angle(angle_to_goal - self.theta)
+        rospy.loginfo(f"nav_to_pose: turning {math.degrees(heading_err):.1f} deg toward goal")
+        self.rotate(heading_err)
+
+        # -- Step 2: drive straight to the goal --
+        dist = math.sqrt(dx ** 2 + dy ** 2)
+        rospy.loginfo(f"nav_to_pose: driving {dist:.2f} m to goal")
+        self.drive_straight(dist)
+
+        # -- Step 3: rotate to match goal orientation --
+        goal_yaw = self.convert_to_euler(goal.pose.orientation)
+        final_err = self._normalize_angle(goal_yaw - self.theta)
+        rospy.loginfo(f"nav_to_pose: final rotation {math.degrees(final_err):.1f} deg")
+        self.rotate(final_err)
+
+        rospy.loginfo("nav_to_pose: goal reached!")
+
+    def random_dance(self, duration: float = 10.0) -> None:
+        """
+        Simple random dance: alternates spin and short drives.
+        Run for `duration` seconds total.
+        """
+        import random
+        rospy.loginfo(f"random_dance: starting for {duration:.1f}s")
+        end_time = rospy.Time.now() + rospy.Duration(duration)
+        while not rospy.is_shutdown() and rospy.Time.now() < end_time:
+            move = random.choice(['forward', 'spin_left', 'spin_right'])
+            if move == 'forward':
+                self.drive_straight(random.uniform(0.1, 0.3), 0.2)
+            elif move == 'spin_left':
+                self.rotate(random.uniform(math.pi / 4, math.pi))
+            else:
+                self.rotate(-random.uniform(math.pi / 4, math.pi))
+            rospy.sleep(0.2)
+        self.stop()
+
+
+# ----------------------------------------------------------------------
+# Main entry point
+# ----------------------------------------------------------------------
+
+def main():
+    """
+    Node entry point. Runs through all lab tasks sequentially.
+    Comment/uncomment sections as needed.
+    """
+    turtle = myTurtle()
+
+    # ── Task 5: Circle with radius 0.5 m ──────────────────────────────
+    rospy.loginfo("=== Task 5: Circle (r=0.5 m) ===")
+    turtle.drive_circle(radius=0.5)
+    rospy.sleep(1.0)
+
+    # ── Task 6: Square with side 0.5 m ────────────────────────────────
+    rospy.loginfo("=== Task 6: Square (0.5 m sides) ===")
+    turtle.drive_square(side=0.5)
+    rospy.sleep(1.0)
+
+    # ── Task 7: Navigate to a pose ────────────────────────────────────
+    # You can also send a goal from the command line:
+    #   rostopic pub /goal_pose geometry_msgs/PoseStamped ...
+    rospy.loginfo("=== Task 7: Navigate to pose (1.0, 0.5, 90 deg) ===")
+    goal = PoseStamped()
+    goal.header.frame_id = "odom"
+    goal.header.stamp = rospy.Time.now()
+    goal.pose.position.x = 1.0
+    goal.pose.position.y = 0.5
+    # 90-degree yaw quaternion
+    q = tf.transformations.quaternion_from_euler(0, 0, math.pi / 2)
+    goal.pose.orientation.x = q[0]
+    goal.pose.orientation.y = q[1]
+    goal.pose.orientation.z = q[2]
+    goal.pose.orientation.w = q[3]
+    turtle.nav_to_pose(goal)
+    rospy.sleep(1.0)
+
+    # ── Task 8: Random dance ──────────────────────────────────────────
+    rospy.loginfo("=== Task 8: Random Dance (10 s) ===")
+    turtle.random_dance(duration=10.0)
+
+    rospy.loginfo("All tasks complete.")
+    turtle.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
